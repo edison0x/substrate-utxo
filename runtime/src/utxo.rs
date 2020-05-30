@@ -75,11 +75,12 @@ decl_storage! {
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
 		fn deposit_event() = default;
-		pub fn spend(_origin, transaction: Transaction) -> DispatchResult {
 
+		pub fn spend(_origin, transaction: Transaction) -> DispatchResult {
 			// 1. Check transaction is valid
+			let reward = Self::validate_transaction(&transaction)?;
+
 			// 2. Write to storage
-			let reward : Value = 0;
 			Self::update_storage(&transaction, reward)?;
 
 			// 3. Emit event
@@ -108,6 +109,70 @@ decl_event! {
 }
 
 impl<T: Trait> Module<T> {
+
+
+	pub fn get_simple_transaction(transaction: &Transaction) -> Vec<u8> {
+
+		let mut trx = transaction.clone();
+		for input in trx.inputs.iter_mut() {
+			input.sigscript = H512::zero(); //0x0000000000000000
+		}
+		trx.encode()
+
+	}
+
+	pub fn validate_transaction(transaction: &Transaction) -> Result<Value, &'static str> {
+		ensure!( transaction.inputs.is_empty(), "No inputs");
+		ensure!( transaction.outputs.is_empty(), "No outputs");
+
+		{
+			let input_set: BTreeMap<_, ()> = transaction.inputs.iter().map(|input| (input, ())).collect();
+			ensure!(input_set.len() == transaction.inputs.len(), "each input must only be used once");
+		}
+
+		{
+			let output_set: BTreeMap<_, ()> = transaction.outputs.iter().map(|output| (output, ())).collect();
+			ensure!(output_set.len() == transaction.outputs.len(), "each output must only be used once");
+		}
+
+		let simple_transaction = Self::get_simple_transaction(transaction);
+		let mut total_input : Value = 0;
+		let mut total_output : Value = 0;
+
+		for input in transaction.inputs.iter() {
+			if let Some(input_utxo) = <UtxoStore>::get(&input.outpoint) {
+				ensure!(
+					sp_io::crypto::sr25519_verify(
+						&Signature::from_raw(
+							*input.sigscript.as_fixed_bytes()),
+							&simple_transaction,
+							&Public::from_h256(input_utxo.pubkey)
+						), "signature must be valid" );
+
+				total_input = total_input.checked_add(input_utxo.value).ok_or("input value overflow")?;
+
+
+			}	else {
+				// todo: Handle race conditions
+
+			}
+		}
+
+		let mut output_index: u64 = 0;
+		for output in transaction.outputs.iter() {
+			ensure!(output.value > 0, "output value must be non-zero");
+			let hash = BlakeTwo256::hash_of(&(&transaction.encode(), output_index));
+			output_index = output_index.checked_add(1).ok_or("output index overflow")?;
+			ensure!(! <UtxoStore>::contains_key(hash), "output already exists");
+			total_output = total_output.checked_add(output.value).ok_or("Output value has overflowed.")?;
+		}
+
+		ensure!( total_input >= total_output, "output value must not exceed the input value");
+		let reward = total_input.checked_sub(total_output).ok_or("reward underflow")?;
+
+		Ok(reward)
+	}
+
 	fn update_storage(transaction: &Transaction, reward: Value) -> DispatchResult {
 		let new_total = <RewardTotal>::get()
 			.checked_add(reward)
@@ -167,7 +232,7 @@ impl<T: Trait> Module<T> {
 
 			if !<UtxoStore>::contains_key(hash) {
 				<UtxoStore>::insert(hash, utxo);
-				sp_runtime::print("transaction reward sent to"); 
+				sp_runtime::print("transaction reward sent to");
 				sp_runtime::print(hash.as_fixed_bytes() as &[u8]);
 			} else {
 				sp_runtime::print("Transaction reward wasted due to a hash collision");
